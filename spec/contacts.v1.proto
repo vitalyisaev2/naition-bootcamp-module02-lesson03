@@ -1,0 +1,277 @@
+syntax = "proto3";
+
+package contacts.v1;
+
+// Контракт contacts.v1 (v0.5). Источник истины по типу/поведению — spec/05;
+// этот файл фиксирует полные тела сообщений, пагинацию, staleness, маппинг
+// ошибок, чтобы инженер не домысливал схему (impl-18). Реализация может
+// добавлять поля, но не менять эти контракты без нового ADR.
+
+// ---- Базовые типы ----
+
+message Employee {
+  string employee_id = 1;          // UUIDv7 — глобально уникальный (I1), immutable
+  string full_name = 2;
+  string work_phone = 3;           // каноническая форма (canon), см. spec/02 «Нормализация»
+  optional string department = 4;
+  optional string title = 5;
+  optional string external_subject = 6; // principal→employee_id привязка (spec/05, impl-20);
+                                        // возвращается ТОЛЬКО админу каталога (R5-M1)
+  optional bool is_admin = 7;      // роль админа каталога (spec/05)
+  int64 version = 8;               // начинается с 1; 0 зарезервирован (impl-19)
+  // deleted не выставляется в чтениях (I6) — tombstone только в репликации (impl-26).
+}
+
+message Contact {
+  string contact_id = 1;           // UUIDv7 — глобально уникальный (I1), immutable
+  string owner_id = 2;             // employee_id владельца книги (scoping I5)
+  string name = 3;
+  string phone = 4;                // каноническая форма
+  int64 version = 5;               // начинается с 1; 0 зарезервирован
+}
+
+// Признак отсталости чтения (ADR-12, annex — заполняется только при
+// распределённой конфигурации, zoom-3). optional, чтобы ядро могло обходиться без.
+message Staleness {
+  message Known {
+    // Взаимоисключающие состояния (R5-M6): либо current, либо stale(seconds).
+    oneof state {
+      bool current = 1;            // отставание < T_stale
+      int64 seconds = 2;           // stale: оценка отставания в секундах
+    }
+  }
+  optional Known state = 1;        // absent = конфигурация не отслеживает staleness
+}
+
+// Match-режим для поиска по номеру (struct-2/design-20). Значение глаголов:
+enum MatchMode {
+  MATCH_EXACT = 0;                 // полный номер → точные совпадения
+  MATCH_PREFIX = 1;                // незавершённый ввод → префиксные
+}
+
+// Read-консистентность (design-16, annex). default — реплика; strong — primary.
+enum ReadConsistency {
+  READ_REPLICA = 0;
+  READ_STRONG = 1;
+}
+
+// Пагинация по курсору (spec/06).
+message PageRequest {
+  int32 limit = 1;                 // по умолчанию 50, 20–200 (clamp вне диапазона, impl-27)
+  string page_token = 2;           // непрозрачный курсор, TTL ≤ 5 мин
+}
+message PageResult {
+  string next_page_token = 1;      // пусто = страниц больше нет
+  optional bool has_more = 2;
+}
+
+// ---- Службы ----
+
+service Employees {
+  rpc Create(CreateEmployeeRequest) returns (CreateEmployeeResponse); // POST /v1/employees
+  rpc Get(GetEmployeeRequest) returns (GetEmployeeResponse);
+  rpc Update(UpdateEmployeeRequest) returns (UpdateEmployeeResponse); // PATCH /v1/employees/{id}
+  rpc Delete(DeleteEmployeeRequest) returns (DeleteEmployeeResponse);
+  rpc SearchByName(SearchEmployeesByNameRequest) returns (SearchEmployeesByNameResponse);
+  rpc SearchByPhone(SearchEmployeesByPhoneRequest) returns (SearchEmployeesByPhoneResponse);
+  rpc ResolvePhone(ResolvePhoneRequest) returns (ResolvePhoneResponse);
+}
+
+service Contacts {
+  rpc Add(AddContactRequest) returns (AddContactResponse);      // POST /v1/me/contacts
+  rpc Get(GetContactRequest) returns (GetContactResponse);
+  rpc Update(UpdateContactRequest) returns (UpdateContactResponse);
+  rpc Delete(DeleteContactRequest) returns (DeleteContactResponse);
+  rpc SearchByName(SearchContactsByNameRequest) returns (SearchContactsByNameResponse);
+  rpc SearchByPhone(SearchContactsByPhoneRequest) returns (SearchContactsByPhoneResponse);
+}
+
+service Profile {
+  rpc Whoami(WhoamiRequest) returns (WhoamiResponse);           // GET /v1/profile
+}
+
+// ---- Каталог ----
+
+message CreateEmployeeRequest {
+  string full_name = 1;
+  string work_phone = 2;
+  optional string department = 3;
+  optional string title = 4;
+  optional string external_subject = 5; // привязка principal (impl-20)
+  optional bool is_admin = 6;           // назначение роли — админом
+  optional string client_request_id = 7;
+}
+message CreateEmployeeResponse {
+  Employee employee = 1;
+  optional Staleness staleness = 2;
+}
+
+message GetEmployeeRequest {
+  string employee_id = 1;
+  ReadConsistency read_consistency = 2; // impl-24: strong доступен на read
+}
+message GetEmployeeResponse {
+  Employee employee = 1;
+  optional Staleness staleness = 2;
+}
+
+message UpdateEmployeeRequest {
+  string employee_id = 1;
+  optional string full_name = 2;
+  optional string work_phone = 3;
+  // field-mask (R5-B3): повторные поля — имена изменяемых полей. Masked поле
+  // записывается как значение на проводе ("" для string / false для bool = очистка);
+  // unmasked поле — без изменений (partial update). Пустая маска = полная замена.
+  repeated string update_mask = 4;     // имена полей для замены/очистки
+  optional string department = 5;
+  optional string title = 6;
+  optional string external_subject = 7; // см. B4: иммутабельно при живой записи
+  optional bool is_admin = 8;
+  optional int64 expected_version = 9; // absent = «последняя версия» (impl-19); иначе CONFLICT
+  optional string client_request_id = 10;
+}
+message UpdateEmployeeResponse {
+  Employee employee = 1;
+  optional Staleness staleness = 2;
+}
+
+message DeleteEmployeeRequest {
+  string employee_id = 1;
+  optional int64 expected_version = 2;
+  optional string client_request_id = 3;
+}
+message DeleteEmployeeResponse {
+  optional Staleness staleness = 1;
+}
+
+message SearchEmployeesByNameRequest {
+  string prefix = 1;
+  PageRequest page = 2;
+  ReadConsistency read_consistency = 3;
+}
+message SearchEmployeesByNameResponse {
+  repeated Employee employees = 1;
+  PageResult page = 2;
+  optional Staleness staleness = 3;
+}
+
+message SearchEmployeesByPhoneRequest {
+  string phone = 1;
+  MatchMode mode = 2;                // spec ↔ proto имена (struct-3): здесь mode
+  PageRequest page = 3;              // только при mode=PREFIX
+  ReadConsistency read_consistency = 4;
+}
+message SearchEmployeesByPhoneResponse {
+  repeated Employee employees = 1;
+  PageResult page = 2;
+  optional Staleness staleness = 3;
+}
+
+// Составной «номер → кто это для меня» (ПУ-2/ПУ-5, impl-3). Курсор (impl-23):
+// сквозной по объединённому диапазону — единый PageResult по catalog+mine.
+message ResolvePhoneRequest {
+  string phone = 1;
+  MatchMode mode = 2;
+  ReadConsistency read_consistency = 3;
+  PageRequest page = 4;              // только при mode=PREFIX
+}
+message ResolvePhoneResponse {
+  repeated Employee catalog = 1;
+  repeated Contact mine = 2;
+  PageResult page = 3;
+  optional Staleness staleness = 4;
+}
+
+// ---- Приватная книга ----
+
+message AddContactRequest {
+  string name = 1;
+  string phone = 2;
+  optional string client_request_id = 3;
+}
+message AddContactResponse {
+  Contact contact = 1;
+  optional Staleness staleness = 2;
+}
+
+message GetContactRequest {
+  string contact_id = 1;
+  ReadConsistency read_consistency = 2;
+}
+message GetContactResponse {
+  Contact contact = 1;
+  optional Staleness staleness = 2;
+}
+
+message UpdateContactRequest {
+  string contact_id = 1;
+  optional string name = 2;
+  optional string phone = 3;
+  // field-mask (R5-B3): повторные поля — имена изменяемых. masked = значение как
+  // на проводе ("" = очистка), unmasked = без изменений. Пустая маска = полная замена.
+  repeated string update_mask = 6;
+  optional int64 expected_version = 4; // absent = последняя (impl-19); иначе CONFLICT
+  optional string client_request_id = 5;
+}
+message UpdateContactResponse {
+  Contact contact = 1;
+  optional Staleness staleness = 2;
+}
+
+message DeleteContactRequest {
+  string contact_id = 1;
+  optional int64 expected_version = 2;
+  optional string client_request_id = 3;
+}
+message DeleteContactResponse {
+  optional Staleness staleness = 1;
+}
+
+message SearchContactsByNameRequest {
+  string prefix = 1;
+  PageRequest page = 2;
+  ReadConsistency read_consistency = 3;
+}
+message SearchContactsByNameResponse {
+  repeated Contact contacts = 1;
+  PageResult page = 2;
+  optional Staleness staleness = 3;
+}
+
+message SearchContactsByPhoneRequest {
+  string phone = 1;
+  MatchMode mode = 2;
+  PageRequest page = 3;              // только при mode=PREFIX
+  ReadConsistency read_consistency = 4;
+}
+message SearchContactsByPhoneResponse {
+  repeated Contact contacts = 1;
+  PageResult page = 2;
+  optional Staleness staleness = 3;
+}
+
+// ---- Профиль ----
+
+message WhoamiRequest {}
+// Whoami (R5-B2): представляет и привязанный, и непривязанный (bootstrap) сценарий.
+message WhoamiResponse {
+  bool bound = 1;                // principal привязан к записи каталога (spec/05)
+  string subject = 2;            // постоянный subject-клейм токена (raw, всегда доступен)
+  string employee_id = 3;        // bound=true: id записи (=owner_id); иначе пусто
+  optional string full_name = 4; // из записи при bound=true
+  optional bool is_admin = 5;    // из записи при bound=true (единый источник, impl-31)
+}
+
+// Маппинг ошибок → gRPC-статусы (единый список, spec/05):
+//   NOT_FOUND            → NotFound
+//   DUPLICATE_PHONE      → AlreadyExists
+//   DUPLICATE_SUBJECT    → AlreadyExists        (impl-20: дубль external_subject)
+//   VALIDATION_ERROR     → InvalidArgument
+//   VERSION_CONFLICT     → Aborted
+//   FORBIDDEN            → PermissionDenied
+//   SERVICE_UNAVAILABLE  → Unavailable (в т.ч. fail-closed fencing, spec/04/08)
+// ТИПИЗИРОВАННЫЙ DETAIL (R5-B1): несколько логических кодов мапятся в один gRPC-
+// статус (DUPLICATE_PHONE и DUPLICATE_SUBJECT → оба AlreadyExists). Каждый ответ
+// об ошибке обязан нести структурированный признак канонического кода (напр.
+// google.rpc.ErrorInfo.reason = "DUPLICATE_SUBJECT"), а не только сообщение.
+// UI/клиент различают сценарии по detail, а не парсингом текста (spec/05, spec/07).
